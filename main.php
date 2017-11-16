@@ -147,7 +147,8 @@ You should have received a copy of the GNU General Public License along with thi
 			
 			if($_POST['vector'] !== 'unserialize')
 			{
-				$source_functions = Sources::$F_OTHER_INPUT;
+                //$source_functions = Sources::$F_OTHER_INPUT;
+                $source_functions = Sources::$V_USERINPUT;
 				// add file and database functions as tainting functions
 				if( $verbosity > 1 && $verbosity < 5 )
 				{
@@ -169,6 +170,9 @@ You should have received a copy of the GNU General Public License along with thi
 				flush();
 	
 				// scan
+                //mylog($scan_functions, 0);
+                //mylog($source_functions);
+
 				$scan = new Scanner($file_scanning, $scan_functions, $info_functions, $source_functions);
 				$scan->parse();
 				$scanned_files[$file_scanning] = $scan->inc_map;
@@ -199,6 +203,7 @@ You should have received a copy of the GNU General Public License along with thi
 
 	################################  RESULT  #################################	
 ?>	
+<!--
 <div id="window1" name="window" style="width:600px; height:250px;">
 	<div class="windowtitlebar">
 		<div id="windowtitle1" onClick="toTop(1)" onmousedown="dragstart(1)" class="windowtitle"></div>
@@ -302,6 +307,8 @@ You should have received a copy of the GNU General Public License along with thi
 	</table>	
 	<hr />	
 	<table class="textcolor" width="100%">	
+
+
 <?php 
 	// output stats
 	if(empty($_POST['search']))
@@ -401,7 +408,9 @@ You should have received a copy of the GNU General Public License along with thi
 
 </div>
 
+-->
+
 <?php 
 	// scan result
-	@printoutput($output, $_POST['treestyle']); 
+	@printoutput($output, $_POST['treestyle']);
 ?>

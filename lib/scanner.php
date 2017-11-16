@@ -1,4 +1,6 @@
 <?php
+error_reporting(E_ALL);
+set_time_limit(0);
 /** 
 
 RIPS - A static source code analyser for vulnerabilities in PHP scripts 
@@ -13,7 +15,10 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 You should have received a copy of the GNU General Public License along with this program; if not, see <http://www.gnu.org/licenses/>.	
 
-**/	
+**/
+
+$verbosity = 1;
+
 
 class Scanner
 {
@@ -113,6 +118,8 @@ class Scanner
 		// tokenizing
 		$tokenizer = new Tokenizer($this->file_pointer);
 		$this->tokens = $tokenizer->tokenize(implode('',$this->lines_pointer));
+
+
 		unset($tokenizer);
 		
 		// add auto includes from php.ini
@@ -150,7 +157,7 @@ class Scanner
 	// returns true if a parameter is tainted by userinput (1=directly tainted, 2=function param)
 	function scan_parameter($mainparent, $parent, $var_token, $var_keys=array(), $last_token_id, $var_declares, $var_declares_global=array(), $userinput, $F_SECURES=array(), $return_scan=false, $ignore_securing=false, $secured=false)
 	{	
-		#print_r(func_get_args());echo "\n----------------\n";
+		//print_r($var_declares);echo "\n----------------\n";
 		$vardependent = false;
 		
 		$var_name = $var_token[1]; 
@@ -593,6 +600,7 @@ class Scanner
 		$GLOBALS['user_functions'][$this->file_name][$this->function_obj->name][1] = array();
 		// doesnt matter if called with userinput or not
 		$GLOBALS['user_functions'][$this->file_name][$this->function_obj->name][3] = true;
+
 	}
 	
 	// add function declaration to parent and mark the block as dependend of this function calls
@@ -620,11 +628,11 @@ class Scanner
 			$map = $key < 0 ? 0 : $key;
 			// scan this userfunction with the vuln parameter
 			$GLOBALS['user_functions'][$this->file_name][$func_name][0][$map] = $key+1;
-			// and with according securing functions from original find					
+			// and with according securing functions from original find
 			$GLOBALS['user_functions'][$this->file_name][$func_name][1] = isset($GLOBALS['scan_functions'][$mainparent->name][1]) ? $GLOBALS['scan_functions'][$mainparent->name][1] : $GLOBALS['user_functions'][$this->file_name][$mainparent->name][1];
 		}
 	}
-	
+
 	// add a variable to the varlist
 	function variable_add($var_name, $tokens, $comment='', $tokenscanstart, $tokenscanstop, $linenr, $id, $array_keys=array(), $additional_keys=array())
 	{
@@ -826,10 +834,505 @@ class Scanner
 		}
 		return false;
 	}
-		
-	// parse tokens of php file, build program model, follow program flow, initiate taint analysis	
+
+	// pre scan called function params before the actual declaration
+	function pre_scan_params($i){
+        $c = 1;
+        $vuln_params = array();
+        $variableid = 1;
+        // get all variables in parameter list
+        while( $this->tokens[$i + $c] !== ';' )
+        {
+            if( is_array($this->tokens[$i + $c]) )
+            {
+                if( $this->tokens[$i + $c][0] === T_VARIABLE )
+				{
+                    // check if returned var is secured --> securing function
+                    $new_find = new VulnTreeNode();
+                    $userinput = $this->scan_parameter(
+                        $new_find,
+                        $new_find,
+                        $this->tokens[$i+$c],
+                        $this->tokens[$i+$c][3],
+                        $i+$c,
+                        $this->var_declares_local,
+                        $this->var_declares_global,
+                        false,
+                        $GLOBALS['F_SECURES_ALL'],
+                        TRUE
+                    );
+
+                    if ($userinput){
+                        $var_declares = ($this->in_function && $this->tokens[$i + $c][1][0] === '$')? $this->var_declares_local : $this->var_declares_global;
+                        $reconstructstr= Analyzer::get_var_value(
+                            $this->file_pointer,
+                            $this->tokens[$i+$c],
+                            $var_declares,
+                            $this->var_declares_global,
+                            $i+$c,
+                            $this->source_functions
+                        );
+
+                    	$vuln_params['id'][] = $variableid;
+                    	$vuln_params['reconstructstr'][] = $reconstructstr;
+					}
+					$variableid+=1;
+
+                    // add function to securing functions
+                    // if it returns no userinput/function param
+                    if((!$userinput || $GLOBALS['userfunction_secures']) && !$this->ignore_securing_function)
+                    {
+                        $GLOBALS['F_SECURING_STRING'][] = $this->function_obj->name;
+                    }
+
+                    // add function to userinput functions if userinput
+                    // is fetched in the function and then returned (userinput == 1)
+                    if($userinput == 1 || $GLOBALS['userfunction_taints'])
+                    {
+                        $this->source_functions[] = $this->function_obj->name;
+                    }
+                }
+                // add function to securing functions if return value is secured
+                else if( in_array($this->tokens[$i + $c][1], $GLOBALS['F_SECURES_ALL'])
+                    || in_array($this->tokens[$i+$c][0], Tokens::$T_CASTS))
+                {
+                    $GLOBALS['F_SECURING_STRING'][] = $this->function_obj->name;
+                    break;
+                }
+            }
+            $c++;
+        }
+        $vuln_params['count'] = $c;
+        return $vuln_params;
+	}
+
+	function taint_analyse($i, $is_previous_call=false, $vuln_params){
+		$token_value = $this->tokens[$i][1];
+		$line_nr = $this->tokens[$i][2];
+		if(!$this->already_scanned($i))
+		{
+			// build new find
+			$new_find = new VulnTreeNode();
+			$new_find->name = $token_value;
+			$new_find->lines[] = $line_nr;
+
+			// add dependencies (already here, because checked during var trace
+			foreach($this->dependencies as $deplinenr=>$dependency)
+			{
+				if(!empty($dependency))
+					$new_find->dependencies[$deplinenr] = $dependency;
+			}
+
+			// count sinks
+			$GLOBALS['file_sinks_count'][$this->file_pointer]++;
+
+			if($this->in_function)
+			{
+				$GLOBALS['user_functions_offset'][$this->function_obj->name][6]++;
+			} else
+			{
+				$GLOBALS['user_functions_offset']['__main__'][6]++;
+			}
+
+			$parameter = 1;
+			$var_counter = 0;
+			$vulnparams = array(0);
+			$has_vuln_parameters = false;
+			$parameter_has_userinput = false;
+			$parameter_func_depend = false;
+			$secured_by_start = false;
+			// function calls without quotes (require $inc;) --> no brace count
+			$parentheses_open = ($this->tokens[$i+1] === '(') ? 1 : -2; // -2: detection of braces doesnt matter
+			$parentheses_save = -1;
+			$in_securing = false;
+			$ignore_securing = false;
+			$c = ($this->tokens[$i+1] === '(') ? 2 : 1; // important
+			$tainted_vars = array();
+
+			$reconstructstr = '';
+			$addtitle='';
+			$this->securedby = array();
+
+
+			if ($is_previous_call && !empty($vuln_params)) {
+				$parameter_has_userinput = true;
+				$vulnparams = $vuln_params['id'];
+
+				if ( array_intersect($vulnparams, $this->scan_functions[$token_value][0])
+					|| (isset($this->scan_functions[$token_value][0][0])
+						&& $this->scan_functions[$token_value][0][0] === 0) ) // all parameters accepted
+				{
+					$has_vuln_parameters = true;
+				}
+            } else {
+                // get all variables in parameter list between (...)
+                // not only until ';' because: system(get($a),$b,strstr($c));
+                while( $parentheses_open !== 0 && $this->tokens[$i + $c] !== ';' )
+                {
+                    $this_one_is_secure = false;
+                    if( is_array($this->tokens[$i + $c]) )
+                    {
+                        // scan variables and constants
+                        if( ($this->tokens[$i + $c][0] === T_VARIABLE && $this->tokens[$i + $c +1][0] !==T_OBJECT_OPERATOR)
+                            || ($this->tokens[$i + $c][0] === T_STRING && $this->tokens[$i + $c+1] !== '(') )
+                        {
+                            $var_counter++;
+                            // scan only potential vulnerable parameters of function call
+                            if ( in_array($parameter, $this->scan_functions[$token_value][0])
+                                || (isset($this->scan_functions[$token_value][0][0])
+                                    && $this->scan_functions[$token_value][0][0] === 0) ) // all parameters accepted
+                            {
+                                $has_vuln_parameters = true;
+
+                                if((is_array($this->tokens[$i+$c-1])
+                                        && in_array($this->tokens[$i+$c-1][0], Tokens::$T_CASTS))
+                                    || (is_array($this->tokens[$i+$c+1])
+                                        && in_array($this->tokens[$i+$c+1][0], Tokens::$T_ARITHMETIC)) || $in_securing )
+                                {
+                                    $secured_by_start = true;
+                                    $this_one_is_secure = true;
+                                }
+
+                                if($in_securing && !$ignore_securing)
+                                    $this->securedby[] = $securing_function;
+
+
+                                $var_declares = ($this->in_function && $this->tokens[$i + $c][1][0] === '$')? $this->var_declares_local : $this->var_declares_global;
+
+                                // trace back parameters and look for userinput, trace constants globally
+                                $userinput = $this->scan_parameter(
+                                    $new_find,
+                                    $new_find,
+                                    $this->tokens[$i+$c],
+                                    $this->tokens[$i+$c][3],
+                                    $i+$c,
+                                    $var_declares,
+                                    $this->var_declares_global,
+                                    false,
+                                    $this->scan_functions[$token_value][1],
+                                    false, // no return-scan
+                                    $ignore_securing,
+                                    ($this_one_is_secure || $in_securing)
+                                );
+
+                                $reconstructstr.= Analyzer::get_var_value(
+                                    $this->file_pointer,
+                                    $this->tokens[$i+$c],
+                                    $var_declares,
+                                    $this->var_declares_global,
+                                    $i+$c,
+                                    $this->source_functions
+                                );
+
+
+                                if($userinput /*&& (!$this_one_is_secure || $GLOBALS['verbosity'] == 3)*/ )
+                                {
+                                    $vulnparams[] = $parameter;
+                                    if($userinput == 1)
+                                        $parameter_has_userinput = true;
+                                    else if($userinput == 2)
+                                        $parameter_func_depend = true;
+                                    $tainted_vars[] = $var_counter;
+                                }
+                            }
+
+                            // mark userinput for quote analysis
+                            if(in_array($this->tokens[$i + $c][1], Sources::$V_USERINPUT))
+                            {
+                                $reconstructstr.='$_USERINPUT';
+                            }
+                        }
+                        // userinput from return value of a function
+                        else if( $this->tokens[$i + $c][0] === T_STRING
+                            && in_array($this->tokens[$i + $c][1], $this->source_functions)
+                            // scan only potential vulnerable parameters of function call
+                            && ( in_array($parameter, $this->scan_functions[$token_value][0])
+                                || (isset($this->scan_functions[$token_value][0][0])
+                                    && $this->scan_functions[$token_value][0][0] === 0) ) )// all parameters accepted
+                        {
+                            $has_vuln_parameters = true;
+                            $parameter_has_userinput = true;
+                            $new_find->marker = 1;
+                            $reconstructstr.='$_USERINPUT';
+                            $new_find->title = 'Userinput returned by function <i>'.$this->tokens[$i + $c][1].'</i> reaches sensitive sink';
+                            $this->addtriggerfunction($new_find);
+                        }
+                        //detect insecuring functions (functions that make previous securing useless)
+                        else if( $this->tokens[$i + $c][0] === T_STRING
+                            && isset($this->tokens[$i+$c][1]) && in_array($this->tokens[$i+$c][1], $GLOBALS['F_INSECURING_STRING'])
+                            && $parentheses_save == -1)
+                        {
+                            $parentheses_save = $parentheses_open;
+                            $ignore_securing = true;
+                        }
+                        // detect securing functions embedded into the sensitive sink
+                        else if( !$ignore_securing && ($this->tokens[$i + $c][0] === T_STRING
+                                && ( (is_array($this->scan_functions[$token_value][1])
+                                        && in_array($this->tokens[$i+$c][1], $this->scan_functions[$token_value][1]))
+                                    || in_array($this->tokens[$i+$c][1], $GLOBALS['F_SECURING_STRING']) ) )
+                            || (in_array($this->tokens[$i+$c][0], Tokens::$T_CASTS) && $this->tokens[$i+$c+1] === '('))
+                        {
+                            $securing_function = $this->tokens[$i+$c][1];
+                            $parentheses_save = $parentheses_open;
+                            $in_securing = true;
+                            $secured_by_start = true;
+                        }
+                        // add strings to reconstructed string for quotes analysis
+                        else if( $this->tokens[$i + $c][0] === T_CONSTANT_ENCAPSED_STRING )
+                        {
+                            $reconstructstr.= substr($this->tokens[$i + $c][1], 1, -1);
+                        }
+                        else if( $this->tokens[$i + $c][0] === T_ENCAPSED_AND_WHITESPACE )
+                        {
+                            $reconstructstr.= $this->tokens[$i + $c][1];
+                        }
+                    }
+                    // count parameters
+                    else if( $parentheses_open === 1 && $this->tokens[$i + $c] === ',' )
+                    {
+                        $parameter++;
+                    }
+                    // watch function calls in function call
+                    else if( $this->tokens[$i + $c] === '(' )
+                    {
+                        $parentheses_open++;
+                    }
+                    else if( $this->tokens[$i + $c] === ')' )
+                    {
+                        $parentheses_open--;
+                        if($parentheses_open === $parentheses_save)
+                        {
+                            $parentheses_save = -1;
+                            $in_securing = false;
+                            $securing_function = '';
+                            $ignore_securing = false;
+                        }
+                    }
+                    else if(!isset($this->tokens[$i+$c]))
+                    {
+                        addError('Closing parenthesis of '.$token_value.'() is missing.', array_slice($this->tokens, $i, 10), $this->tokens[$i][2], $this->file_pointer);
+                        break;
+                    }
+                    $c++;
+                }
+
+            }
+
+
+
+			// quote analysis for securing functions F_QUOTE_ANALYSIS
+			// they only protect when return value is embedded into quotes
+			if( $this->quote_analysis_needed() && substr_count($reconstructstr, '$_USERINPUT')  > 0 )
+			{
+				// idea: explode on $_USERINPUT and count quotes in SQL query before
+				// if not even, then the $_USERINPUT is in an open quote
+				$parts = explode('$_USERINPUT', $reconstructstr);
+				foreach($this->securedby as $var=>$securefunction)
+				{
+					if(in_array($securefunction, $GLOBALS['F_QUOTE_ANALYSIS']))
+					{
+						// extract the string before the userinput
+						$checkstring = '';
+						$d=1;
+						foreach($parts as $part)
+						{
+							$checkstring.=$part;
+							if($d>=$var)
+								break;
+							$d++;
+						}
+
+						// even amount of quotes (or none) in string
+						// --> no quotes around userinput
+						// --> securing function is	useless
+						if(substr_count($checkstring, "'") % 2 === 0
+							&& substr_count($checkstring, '"') % 2 === 0)
+						{
+							$has_vuln_parameters = true;
+							$parameter_has_userinput = true;
+							$new_find->title .= "Userinput reaches sensitive sink due to insecure usage of $securefunction() without quotes";
+						}
+					}
+				}
+			}
+
+			// add find to output if function call has variable parameters (With userinput)
+			if( ($has_vuln_parameters && ($parameter_has_userinput || $parameter_func_depend)) || $GLOBALS['verbosity'] == 4 || isset($this->scan_functions[$token_value][3]) )
+			{
+				$vulnstart=$i;
+				$vulnadd=1;
+				// prepend $var assignment
+				if(isset($vardeclare))
+				{
+					$vulnstart = $vardeclare['start'];
+					$vulnadd = $vardeclare['end']-$vardeclare['start']-$c+1;//3;
+				}
+				// prepend echo statement
+				else if(isset($GLOBALS['F_XSS'][$this->tokens[$i-1][1]]))
+				{
+					$vulnstart = $i-1;
+					$vulnadd = 2;
+				}
+				// prepend class var
+				else if($this->tokens[$i-1][0] === T_DOUBLE_COLON || $this->tokens[$i-1][0] === T_OBJECT_OPERATOR)
+				{
+					$vulnstart = $i-2;
+					$vulnadd = 2;
+				}
+
+				if ($is_previous_call){
+					$vulnadd = $vuln_params['count'];
+				}
+
+				if(isset($GLOBALS['user_functions'][$this->file_name][$token_value]))
+				{
+					$found_line = '<A NAME="'.$token_value.'_call" class="jumplink"></A>';
+					$found_line.= highlightline(array_slice($this->tokens,$vulnstart,$c+$vulnadd),$this->comment, $line_nr, false, $token_value);
+				} else
+				{
+					$found_line = highlightline(array_slice($this->tokens,$vulnstart,$c+$vulnadd),$this->comment, $line_nr, $token_value, false, $tainted_vars);
+				}
+
+				$new_find->value = $found_line;
+				$new_find->filename = $this->file_pointer;
+
+				if($secured_by_start)
+					$new_find->marker = 2;
+
+				// only show vuln user defined functions
+				// if call with userinput has been found
+				if( isset($GLOBALS['user_functions'][$this->file_name][$token_value]) )
+					$GLOBALS['user_functions'][$this->file_name][$token_value]['called'] = true;
+
+				if($this->in_function)
+				{
+					$this->ignore_securing_function = true;
+					// mark function in class as vuln
+					if($this->in_class)
+					{
+						$this->vuln_classes[$this->class_name][] = $this->function_obj->name;
+					}
+				}
+
+				// putenv with userinput --> getenv is treated as userinput
+				if($token_value === 'putenv')
+				{
+					$this->source_functions[] = 'getenv';
+					$GLOBALS['source_functions'][] = 'getenv';
+					$new_find->title = 'User can set PHP enviroment variables. Adding getenv() to tainting functions';
+				}
+				else if($token_value === 'apache_setenv')
+				{
+					$this->source_functions[] = 'apache_getenv';
+					$GLOBALS['source_functions'][] = 'apache_getenv';
+					$new_find->title = 'User can set Apache enviroment variables. Adding apache_getenv() to tainting functions';
+				}
+				else if($token_value === 'extract' || $token_value === 'parse_str' || $token_value === 'mb_parse_str')
+				{
+					// add register_globals implementation
+					$this->variable_add(
+						'register_globals',
+						array_slice($this->tokens,$vulnstart,$c+$vulnadd),
+						'register_globals implementation',
+						0, 0,
+						$line_nr,
+						$i,
+						isset($this->tokens[$i][3]) ? $this->tokens[$i][3] : array()
+					);
+				}
+
+				// add to output
+				if(isset($GLOBALS['user_functions'][$this->file_name][$token_value]))
+				{
+					if(!empty($GLOBALS['output'][$this->file_name]))
+					{
+						foreach($GLOBALS['output'][$this->file_name] as $block)
+						{
+							$calleesadded = array();
+							foreach($block->treenodes as $tree)
+							{
+								if($tree->funcdepend === $token_value
+									&& (array_intersect($tree->funcparamdepend, $vulnparams) || isset($this->scan_functions[$token_value][3]) ))
+								{
+									// if funcdependend already found and added, just add foundcallee=true and continue
+									// dont add tree again, it is already added to the wvulnblock
+									if(in_array($tree->funcdepend, $calleesadded))
+									{
+										$tree->foundcallee = true;
+										continue;
+									}
+
+									if(isset($this->scan_functions[$token_value][3]))
+										$new_find->title = 'Call triggers vulnerability in function <i>'.$token_value.'()</i>';
+									else if(empty($new_find->title))
+										$new_find->title = 'Userinput is passed through function parameters.';
+
+									$exist = false;
+									foreach($block->treenodes as $tn){
+										if ($tn->value === $new_find->value && $tn->filename === $new_find->filename){
+											$exist = true;
+											break;
+										}
+									}
+
+									if (!$exist) {
+										$block->treenodes[] = $new_find;
+                                    }
+
+									if(!$block->vuln && ($parameter_has_userinput || isset($this->scan_functions[$token_value][3]) || $GLOBALS['verbosity'] == 4))
+									{
+										$block->vuln = true;
+										increaseVulnCounter($block->sink);
+									}
+
+									$tree->foundcallee = true;
+									$calleesadded[] = $token_value;
+								}
+							}
+						}
+						// else: dont use the result
+					}
+				} else
+				{
+					if(empty($new_find->title))
+						$new_find->title = 'Userinput reaches sensitive sink. For more information, press the help icon on the left side.';
+					$block = new VulnBlock($this->tif.'_'.$this->tokens[$i][2].'_'.basename($this->file_pointer), getVulnNodeTitle($token_value), $token_value);
+					$block->treenodes[] = $new_find;
+					if($parameter_has_userinput || $GLOBALS['verbosity'] == 4)
+					{
+						$block->vuln = true;
+						increaseVulnCounter($token_value);
+					}
+					// if sink in var declare, offer a data leak scan - save infos for that
+					if(isset($vardeclare))
+						$block->dataleakvar = array($vardeclare['linenr'], $vardeclare['name']);
+
+					$GLOBALS['output'][$this->file_name][] = $block;
+					//unset($GLOBALS['output'][$this->file_name][0]->treenodes[0]->children);
+				}
+
+			}
+
+			//
+
+			// if classvar depends on function parameter, add this parameter to list
+			if( isset($this->classvar) && $this->in_function && in_array($this->classvar, $this->function_obj->parameters) )
+			{
+				$param = array_search($this->classvar, $this->function_obj->parameters);
+				$GLOBALS['user_functions'][$this->file_name][$this->function_obj->name][0][$param] = $param+1;
+			}
+
+			if ($has_vuln_parameters &&  $parameter_func_depend){
+				return 2;
+			}
+		}
+
+	}
+
+	// parse tokens of php file, build pro=gram model, follow program flow, initiate taint analysis
 	function parse()
 	{
+		//print_r($this->tokens);
 		// scan all tokens
 		for($i=0,$tokencount=count($this->tokens); $i<$tokencount;  $i++, $this->tif++)
 		{		
@@ -838,6 +1341,14 @@ class Scanner
 				$token_name = $this->tokens[$i][0];
 				$token_value = $this->tokens[$i][1];
 				$line_nr = $this->tokens[$i][2];
+
+				if (strtolower($token_value) === 'dofirmwareupgradetftp') {
+					echo $token_name;
+                }
+                if (strtolower($token_value) === 'exec' && $this->function_obj->name === 'dofirmwareupgradetftp') {
+                    echo $token_name;
+                }
+
 				
 				// add preloader info for big files
 				if($line_nr  % PRELOAD_SHOW_LINE == 0)
@@ -1130,7 +1641,7 @@ class Scanner
 							$token_value = str_replace(array('"',"'"), '', $this->tokens[$i+2][1]);
 						}	
 						// $array = compact("event", "city");
-						else if($token_value === 'compact'  
+						else if($token_value === 'compact'
 						&& $this->tokens[$i-2][0] === T_VARIABLE)
 						{
 							$f=2;
@@ -1162,8 +1673,8 @@ class Scanner
 									break;	
 								}
 							}
-						}	
-						// preg_match($regex, $source, $matches), save $matches as var declare	
+						}
+						// preg_match($regex, $source, $matches), save $matches as var declare
 						else if($token_value === 'preg_match' || $token_value === 'preg_match_all')
 						{
 							$c = 2;
@@ -1308,6 +1819,23 @@ class Scanner
 								} else
 								{
 									$GLOBALS['user_functions_offset']['__main__'][4][] = $token_value;
+								}
+							}else{ // save function called before declared, fix missing function
+                                //$GLOBALS['user_functions_offset'][($class?$class.'::':'').$token_value][7][] = array($this->file_pointer, $line_nr);
+
+								if (!in_array($token_value, key($this->scan_functions)) && !in_array($token_value, get_defined_functions()['internal'])){
+                                    $vuln_params = $this->pre_scan_params($i);
+                                    if (!empty($vuln_params)){
+                                    	$undeclared_func = array($i, $token_value, $vuln_params);
+                                    	if($this->in_function)
+                                        {
+                                        	$name = ($class?$class.'::':'') . $this->function_obj->name;
+                                            $GLOBALS['undeclared_user_functions'][$this->file_pointer][$this->function_obj->name][] = $undeclared_func;
+                                        } else
+                                        {
+                                            $GLOBALS['undeclared_user_functions'][$this->file_pointer]['__main__'][] = $undeclared_func;
+                                        }
+									}
 								}
 							}
 								
@@ -1569,393 +2097,40 @@ class Scanner
 							}
 						}
 						
-					}	
+					}
 
-					/*************************
-						TAINT ANALYSIS			
-					*************************/	
-					if(isset($this->scan_functions[$token_value]) && $GLOBALS['verbosity'] != 5
-					// not a function of a class or a function of a vulnerable class
-					&& (empty($class) || (($this->in_function && is_array($function_obj->parameters) && in_array($classvar, $function_obj->parameters)) || @in_array($token_value, $this->vuln_classes[$class]))) )
-					{	
-						if(!$this->already_scanned($i))
-						{
-							// build new find					 
-							$new_find = new VulnTreeNode();
-							$new_find->name = $token_value;
-							$new_find->lines[] = $line_nr;
-							
-							// add dependencies (already here, because checked during var trace
-							foreach($this->dependencies as $deplinenr=>$dependency)
-							{
-								if(!empty($dependency))
-									$new_find->dependencies[$deplinenr] = $dependency;
-							}	
-							
-							// count sinks
-							$GLOBALS['file_sinks_count'][$this->file_pointer]++;
+                    /*************************
+                    TAINT ANALYSIS
+                     *************************/
 
-							if($this->in_function)
-							{
-								$GLOBALS['user_functions_offset'][$this->function_obj->name][6]++;
-							} else
-							{
-								$GLOBALS['user_functions_offset']['__main__'][6]++;
+
+                    if(isset($this->scan_functions[$token_value]) && $GLOBALS['verbosity'] != 5
+                        // not a function of a class or a function of a vulnerable class
+                        && (empty($class) || (($this->in_function && is_array($function_obj->parameters) && in_array($classvar, $function_obj->parameters)) || @in_array($token_value, $this->vuln_classes[$class]))) )
+                    {
+                        $ret = $this->taint_analyse($i);
+                        // once found a vuln function with parameters passed through userinput.
+                        if ($ret == 2 && $this->in_function) {
+
+                        	foreach ($GLOBALS['undeclared_user_functions'][$this->file_pointer] as $func => $undeclared_funcs){
+                        		if (isset($undeclared_funcs)) {
+                                    foreach ($undeclared_funcs as $undeclared_func) {
+                                        if ($undeclared_func[1] === $this->function_obj->name) {
+
+                                            if (isset($GLOBALS['user_functions'][$this->file_name])) {
+                                                $this->scan_functions = array_merge($this->scan_functions, $GLOBALS['user_functions'][$this->file_name]);
+                                            }
+
+                                            $token_id = $undeclared_func[0];
+                                            $vulnparams = $undeclared_func[2];
+                                            $this->taint_analyse($token_id, true, $vulnparams);
+                                        }
+                                    }
+                                }
+
 							}
-
-							$parameter = 1;
-							$var_counter = 0;
-							$vulnparams = array(0);
-							$has_vuln_parameters = false;
-							$parameter_has_userinput = false;
-							$parameter_func_depend = false;
-							$secured_by_start = false;
-							// function calls without quotes (require $inc;) --> no brace count
-							$parentheses_open = ($this->tokens[$i+1] === '(') ? 1 : -2; // -2: detection of braces doesnt matter
-							$parentheses_save = -1;
-							$in_securing = false;
-							$ignore_securing = false;
-							$c = ($this->tokens[$i+1] === '(') ? 2 : 1; // important
-							$tainted_vars = array();
-							
-							$reconstructstr = '';
-							$addtitle='';
-							$this->securedby = array();
-
-							// get all variables in parameter list between (...)
-							// not only until ';' because: system(get($a),$b,strstr($c));
-							while( $parentheses_open !== 0 && $this->tokens[$i + $c] !== ';' )
-							{
-								$this_one_is_secure = false;
-								if( is_array($this->tokens[$i + $c]) )
-								{	
-									// scan variables and constants
-									if( ($this->tokens[$i + $c][0] === T_VARIABLE && $this->tokens[$i + $c +1][0] !==T_OBJECT_OPERATOR)
-									|| ($this->tokens[$i + $c][0] === T_STRING && $this->tokens[$i + $c+1] !== '(') )
-									{
-										$var_counter++;
-										// scan only potential vulnerable parameters of function call
-										if ( in_array($parameter, $this->scan_functions[$token_value][0]) 
-										|| (isset($this->scan_functions[$token_value][0][0])
-											&& $this->scan_functions[$token_value][0][0] === 0) ) // all parameters accepted
-										{			
-											$has_vuln_parameters = true;
-
-											if((is_array($this->tokens[$i+$c-1]) 
-											&& in_array($this->tokens[$i+$c-1][0], Tokens::$T_CASTS))
-											|| (is_array($this->tokens[$i+$c+1]) 
-											&& in_array($this->tokens[$i+$c+1][0], Tokens::$T_ARITHMETIC)) || $in_securing )		
-											{
-												$secured_by_start = true;
-												$this_one_is_secure = true;
-											}
-			
-											if($in_securing && !$ignore_securing)
-												$this->securedby[] = $securing_function;
-			
-											// trace back parameters and look for userinput, trace constants globally
-											$userinput = $this->scan_parameter(
-												$new_find, 
-												$new_find, 
-												$this->tokens[$i+$c], 
-												$this->tokens[$i+$c][3],
-												$i+$c,
-												($this->in_function && $this->tokens[$i + $c][1][0] === '$') ? $this->var_declares_local : $this->var_declares_global, 
-												$this->var_declares_global,  
-												false, 
-												$this->scan_functions[$token_value][1], 
-												false, // no return-scan
-												$ignore_securing, 
-												($this_one_is_secure || $in_securing)
-											);										
-
-											$reconstructstr.= Analyzer::get_var_value(
-												$this->file_pointer,
-												$this->tokens[$i+$c], 
-												($this->in_function && $this->tokens[$i + $c][1][0] === '$') ? $this->var_declares_local : $this->var_declares_global, 
-												$this->var_declares_global, 
-												$i+$c,
-												$this->source_functions
-											);	
-											
-											
-											if($userinput /*&& (!$this_one_is_secure || $GLOBALS['verbosity'] == 3)*/ )
-											{
-												$vulnparams[] = $parameter;
-												if($userinput == 1)
-													$parameter_has_userinput = true;
-												else if($userinput == 2)
-													$parameter_func_depend = true;
-												$tainted_vars[] = $var_counter;
-											} 
-										} 
-										
-										// mark userinput for quote analysis
-										if(in_array($this->tokens[$i + $c][1], Sources::$V_USERINPUT))
-										{
-											$reconstructstr.='$_USERINPUT';
-										}
-									}
-									// userinput from return value of a function
-									else if( $this->tokens[$i + $c][0] === T_STRING 
-									&& in_array($this->tokens[$i + $c][1], $this->source_functions) 
-									// scan only potential vulnerable parameters of function call
-									&& ( in_array($parameter, $this->scan_functions[$token_value][0]) 
-									|| (isset($this->scan_functions[$token_value][0][0])
-									&& $this->scan_functions[$token_value][0][0] === 0) ) )// all parameters accepted
-									{	
-										$has_vuln_parameters = true;
-										$parameter_has_userinput = true;
-										$new_find->marker = 1; 
-										$reconstructstr.='$_USERINPUT';
-										$new_find->title = 'Userinput returned by function <i>'.$this->tokens[$i + $c][1].'</i> reaches sensitive sink';
-										$this->addtriggerfunction($new_find);
-									}	
-									//detect insecuring functions (functions that make previous securing useless)
-									else if( $this->tokens[$i + $c][0] === T_STRING 
-									&& isset($this->tokens[$i+$c][1]) && in_array($this->tokens[$i+$c][1], $GLOBALS['F_INSECURING_STRING']) 
-									&& $parentheses_save == -1)
-									{
-										$parentheses_save = $parentheses_open;
-										$ignore_securing = true;
-									}
-									// detect securing functions embedded into the sensitive sink
-									else if( !$ignore_securing && ($this->tokens[$i + $c][0] === T_STRING 
-									&& ( (is_array($this->scan_functions[$token_value][1]) 
-									&& in_array($this->tokens[$i+$c][1], $this->scan_functions[$token_value][1]))
-									|| in_array($this->tokens[$i+$c][1], $GLOBALS['F_SECURING_STRING']) ) ) 
-									|| (in_array($this->tokens[$i+$c][0], Tokens::$T_CASTS) && $this->tokens[$i+$c+1] === '('))
-									{
-										$securing_function = $this->tokens[$i+$c][1];
-										$parentheses_save = $parentheses_open;
-										$in_securing = true;
-										$secured_by_start = true;
-									}
-									// add strings to reconstructed string for quotes analysis
-									else if( $this->tokens[$i + $c][0] === T_CONSTANT_ENCAPSED_STRING )
-									{
-										$reconstructstr.= substr($this->tokens[$i + $c][1], 1, -1);
-									}
-									else if( $this->tokens[$i + $c][0] === T_ENCAPSED_AND_WHITESPACE )
-									{
-										$reconstructstr.= $this->tokens[$i + $c][1];
-									}
-								}	
-								// count parameters
-								else if( $parentheses_open === 1 && $this->tokens[$i + $c] === ',' )
-								{
-									$parameter++;
-								}
-								// watch function calls in function call
-								else if( $this->tokens[$i + $c] === '(' )
-								{
-									$parentheses_open++;
-								}
-								else if( $this->tokens[$i + $c] === ')' )
-								{
-									$parentheses_open--;
-									if($parentheses_open === $parentheses_save)
-									{
-										$parentheses_save = -1;
-										$in_securing = false;
-										$securing_function = '';
-										$ignore_securing = false;
-									}	
-								}
-								else if(!isset($this->tokens[$i+$c]))
-								{
-									addError('Closing parenthesis of '.$token_value.'() is missing.', array_slice($this->tokens, $i, 10), $this->tokens[$i][2], $this->file_pointer);
-									break;	
-								}
-								$c++;
-							}	
-
-							// quote analysis for securing functions F_QUOTE_ANALYSIS
-							// they only protect when return value is embedded into quotes
-							if( $this->quote_analysis_needed() && substr_count($reconstructstr, '$_USERINPUT')  > 0 )
-							{
-								// idea: explode on $_USERINPUT and count quotes in SQL query before
-								// if not even, then the $_USERINPUT is in an open quote
-								$parts = explode('$_USERINPUT', $reconstructstr);
-								foreach($this->securedby as $var=>$securefunction)
-								{
-									if(in_array($securefunction, $GLOBALS['F_QUOTE_ANALYSIS']))
-									{
-										// extract the string before the userinput
-										$checkstring = '';
-										$d=1;
-										foreach($parts as $part)
-										{
-											$checkstring.=$part;
-											if($d>=$var)
-												break;
-											$d++;	
-										}
-
-										// even amount of quotes (or none) in string 
-										// --> no quotes around userinput
-										// --> securing function is	useless
-										if(substr_count($checkstring, "'") % 2 === 0
-										&& substr_count($checkstring, '"') % 2 === 0)
-										{
-											$has_vuln_parameters = true;
-											$parameter_has_userinput = true;
-											$new_find->title .= "Userinput reaches sensitive sink due to insecure usage of $securefunction() without quotes";
-										}
-									}
-								}
-							}
-							
-							// add find to output if function call has variable parameters (With userinput)
-							if( ($has_vuln_parameters && ($parameter_has_userinput || $parameter_func_depend)) || $GLOBALS['verbosity'] == 4 || isset($this->scan_functions[$token_value][3]) ) 
-							{
-								$vulnstart=$i;
-								$vulnadd=1;
-								// prepend $var assignment
-								if(isset($vardeclare))
-								{
-									$vulnstart = $vardeclare['start'];
-									$vulnadd = $vardeclare['end']-$vardeclare['start']-$c+1;//3;
-								}	
-								// prepend echo statement
-								else if(isset($GLOBALS['F_XSS'][$this->tokens[$i-1][1]]))
-								{
-									$vulnstart = $i-1;
-									$vulnadd = 2;
-								}	
-								// prepend class var
-								else if($this->tokens[$i-1][0] === T_DOUBLE_COLON || $this->tokens[$i-1][0] === T_OBJECT_OPERATOR)
-								{
-									$vulnstart = $i-2;
-									$vulnadd = 2;
-								}
-							
-								if(isset($GLOBALS['user_functions'][$this->file_name][$token_value]))
-								{
-									$found_line = '<A NAME="'.$token_value.'_call" class="jumplink"></A>';
-									$found_line.= highlightline(array_slice($this->tokens,$vulnstart,$c+$vulnadd),$this->comment, $line_nr, false, $token_value);
-								} else
-								{
-									$found_line = highlightline(array_slice($this->tokens,$vulnstart,$c+$vulnadd),$this->comment, $line_nr, $token_value, false, $tainted_vars);
-								}
-								
-								$new_find->value = $found_line;
-								$new_find->filename = $this->file_pointer;
-							
-								if($secured_by_start)
-									$new_find->marker = 2; 
-
-								// only show vuln user defined functions 
-								// if call with userinput has been found
-								if( isset($GLOBALS['user_functions'][$this->file_name][$token_value]) )
-									$GLOBALS['user_functions'][$this->file_name][$token_value]['called'] = true;
-								
-								if($this->in_function)
-								{
-									$this->ignore_securing_function = true;
-									// mark function in class as vuln
-									if($this->in_class)
-									{
-										$this->vuln_classes[$this->class_name][] = $this->function_obj->name;
-									}						
-								}
-								
-								// putenv with userinput --> getenv is treated as userinput
-								if($token_value === 'putenv')
-								{
-									$this->source_functions[] = 'getenv';
-									$GLOBALS['source_functions'][] = 'getenv';
-									$new_find->title = 'User can set PHP enviroment variables. Adding getenv() to tainting functions';
-								}
-								else if($token_value === 'apache_setenv')
-								{
-									$this->source_functions[] = 'apache_getenv';
-									$GLOBALS['source_functions'][] = 'apache_getenv';
-									$new_find->title = 'User can set Apache enviroment variables. Adding apache_getenv() to tainting functions';
-								}
-								else if($token_value === 'extract' || $token_value === 'parse_str' || $token_value === 'mb_parse_str')
-								{
-									// add register_globals implementation
-									$this->variable_add(
-										'register_globals', 
-										array_slice($this->tokens,$vulnstart,$c+$vulnadd), 
-										'register_globals implementation', 
-										0, 0, 
-										$line_nr, 
-										$i, 
-										isset($this->tokens[$i][3]) ? $this->tokens[$i][3] : array()
-									);							
-								}
-							
-								// add to output							
-								if(isset($GLOBALS['user_functions'][$this->file_name][$token_value]))
-								{	
-									if(!empty($GLOBALS['output'][$this->file_name]))
-									{
-										foreach($GLOBALS['output'][$this->file_name] as $block)
-										{
-											$calleesadded = array();
-											foreach($block->treenodes as $tree)
-											{
-												if($tree->funcdepend === $token_value 
-												&& (array_intersect($tree->funcparamdepend, $vulnparams) || isset($this->scan_functions[$token_value][3]) ))
-												{
-													// if funcdependend already found and added, just add foundcallee=true and continue
-													// dont add tree again, it is already added to the vulnblock
-													if(in_array($tree->funcdepend, $calleesadded))
-													{
-														$tree->foundcallee = true;
-														continue;
-													}
-												
-													if(isset($this->scan_functions[$token_value][3]))
-														$new_find->title = 'Call triggers vulnerability in function <i>'.$token_value.'()</i>';
-													else if(empty($new_find->title))
-														$new_find->title = 'Userinput is passed through function parameters.';
-														
-													$block->treenodes[] = $new_find;
-													if(!$block->vuln && ($parameter_has_userinput || isset($this->scan_functions[$token_value][3]) || $GLOBALS['verbosity'] == 4))
-													{
-														$block->vuln = true;
-														increaseVulnCounter($block->sink);
-													}	
-													
-													$tree->foundcallee = true;
-													$calleesadded[] = $token_value;
-												}
-											}
-										}
-										// else: dont use the result
-									}
-								} else
-								{
-									if(empty($new_find->title))
-										$new_find->title = 'Userinput reaches sensitive sink. For more information, press the help icon on the left side.';
-									$block = new VulnBlock($this->tif.'_'.$this->tokens[$i][2].'_'.basename($this->file_pointer), getVulnNodeTitle($token_value), $token_value);
-									$block->treenodes[] = $new_find;
-									if($parameter_has_userinput || $GLOBALS['verbosity'] == 4)
-									{
-										$block->vuln = true;
-										increaseVulnCounter($token_value);
-									}	
-									// if sink in var declare, offer a data leak scan - save infos for that
-									if(isset($vardeclare))
-										$block->dataleakvar = array($vardeclare['linenr'], $vardeclare['name']);
-
-									$GLOBALS['output'][$this->file_name][] = $block;
-								}
-								
-							}
-
-							// if classvar depends on function parameter, add this parameter to list
-							if( isset($this->classvar) && $this->in_function && in_array($this->classvar, $this->function_obj->parameters) ) 
-							{
-								$param = array_search($this->classvar, $this->function_obj->parameters);
-								$GLOBALS['user_functions'][$this->file_name][$this->function_obj->name][0][$param] = $param+1;
-							} 
-						
-						} 
-					} // taint analysis		
+						}
+                    }
 				}	
 				
 				/*************************
@@ -2339,4 +2514,47 @@ class Scanner
 		return $this->inc_map;
 	}
 }	
+
+
+function mylog($var, $died=1){
+	echo "<pre>";
+	print_r($var);
+	echo "</pre>";
+	ob_flush();
+	if ($died) die(0);
+}
+
+function test(){
+
+
+    include('../config/general.php');			// general settings
+    include('../config/sources.php');			// tainted variables and functions
+    include('../config/tokens.php');			// tokens for lexical analysis
+    include('../config/securing.php');			// securing functions
+    include('../config/sinks.php');			// sensitive sinks
+    include('../config/info.php');				// interesting functions
+
+    include('constructer.php'); 		// classes
+
+    include('filer.php');				// read files from dirs and subdirs
+    include('tokenizer.php');			// prepare and fix token list
+    include('analyzer.php');			// string analyzers
+    //include('scanner.php');				// provides class for scan
+    include('printer.php');				// output scan result
+    include('searcher.php');			// search functions
+
+
+
+    ###############################  MAIN  ####################################
+    $scan_functions = $F_EXEC;
+	$file_scanning = "/home/wwwroot/default/test/2.php";
+    $info_functions = Info::$F_INTEREST;
+    $source_functions = Sources::$V_USERINPUT;
+
+    $scan = new Scanner($file_scanning, $scan_functions, $info_functions, $source_functions);
+    $scan->parse();
+
+}
+
+//test();
 ?>	

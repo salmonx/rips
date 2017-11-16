@@ -45,7 +45,7 @@ include 'config/general.php';
 		<table class="menutable" width="50%" style="float:left;">
 		<tr>
 			<td nowrap><b>path / file:</b></td>
-			<td colspan="3" nowrap><input type="text" size=80 id="location" value="<?php echo BASEDIR; ?>" title="enter path to PHP file(s)" placeholder="/var/www/">
+			<td colspan="3" nowrap><input type="text" size=80 id="location" value="/home/wwwroot/default/test" title="enter path to PHP file(s)" placeholder="/tmp/www/test">
 			</td>
 			<td nowrap><input type="checkbox" id="subdirs" value="1" title="check to scan subdirectories" checked/>subdirs
 			</td>
@@ -77,12 +77,11 @@ include 'config/general.php';
 			<td>
 				<select id="vector" style="width:100%" title="select vulnerability type to scan">
 					<?php 
-					
 						$vectors = array(
 							'all' 			=> 'All',
 							'server' 		=> 'All server-side',							
 							'code' 			=> '- Code Execution',
-							'exec' 			=> '- Command Execution',
+							'exec' 			=> 'Command Execution',
 							'file_read' 	=> '- File Disclosure',
 							'file_include' 	=> '- File Inclusion',							
 							'file_affect' 	=> '- File Manipulation',
@@ -100,6 +99,9 @@ include 'config/general.php';
 							//'crypto'		=> 'Crypto hints'
 						);
 						
+						$vectors = array(
+							'exec' 			=> 'Command Execution',
+						);
 						foreach($vectors as $vector=>$description)
 						{
 							echo "<option value=\"$vector\" ";
